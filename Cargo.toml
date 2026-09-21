@@ -1,0 +1,33 @@
+[package]
+name = "com_pineriver_nodeupdater"
+description = "Checks for new Panel, Wings and DB Agent releases, compares them with what every node runs, notifies admins and updates nodes remotely through the Wings/DB Agent upgrade API or over SSH (Docker Compose, package manager or binary installs)."
+authors = ["PineRiver"]
+version = "1.0.0"
+edition = "2024"
+build = "src/build.rs"
+
+[dependencies]
+shared = { workspace = true }
+wings-api = { workspace = true }
+db-agent-api = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true, features = ["json"] }
+chrono = { workspace = true }
+uuid = { workspace = true }
+compact_str = { workspace = true }
+indexmap = { workspace = true }
+semver = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+russh = { workspace = true }
+futures-util = { workspace = true }
+minijinja = { workspace = true }
+reqwest = { workspace = true }

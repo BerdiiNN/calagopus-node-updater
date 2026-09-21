@@ -1,0 +1,6 @@
+/target/
+node_modules/
+dist/
+*.c7s
+*.c7s.zip
+Cargo.lock

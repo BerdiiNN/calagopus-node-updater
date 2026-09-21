@@ -1,0 +1,9 @@
+{
+  "name": "com_pineriver_nodeupdater",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {}
+}

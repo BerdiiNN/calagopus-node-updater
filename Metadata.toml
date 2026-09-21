@@ -1,0 +1,7 @@
+package_name = "com.pineriver.nodeupdater"
+name = "Node Updater"
+author = "PineRiver"
+version = "1.0.0"
+panel_version = ">=1.1.0"
+description = "Keeps Wings nodes and DB Agent hosts current: checks GitHub and calagopus.com for new Panel, Wings and DB Agent releases, compares them with what every node actually runs, notifies admins (email, Discord, webhook, in-panel) and updates nodes remotely through the Wings/DB Agent upgrade API or over SSH (Docker Compose, package manager or binary installs), with a run log per update."
+license = "MIT"

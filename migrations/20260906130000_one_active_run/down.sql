@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS com_pineriver_nodeupdater_runs_one_active;

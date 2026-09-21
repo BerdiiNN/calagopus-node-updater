@@ -1,0 +1,10 @@
+{
+  "extends": "../../../frontend/tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["../../../frontend/src/*"],
+      "shared": ["../../../frontend/extensions/shared/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}

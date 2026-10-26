@@ -2,7 +2,7 @@
 name = "com_pineriver_nodeupdater"
 description = "Checks for new Panel, Wings and DB Agent releases, compares them with what every node runs, notifies admins and updates nodes remotely through the Wings/DB Agent upgrade API or over SSH (Docker Compose, package manager or binary installs)."
 authors = ["PineRiver"]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 build = "src/build.rs"
 

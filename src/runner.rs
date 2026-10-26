@@ -293,34 +293,55 @@ async fn perform(state: &State, run: &RunRow, settings: &ExtensionSettings, logg
         db::STRATEGY_API => {
             let overview = overview.as_ref().ok_or_else(|| anyhow!("the daemon is unreachable"))?;
             let names = scripts::names(&run.kind);
-            let restart = target
-                .as_ref()
-                .map(|t| t.restart_command.trim().to_string())
-                .filter(|c| !c.is_empty())
-                .unwrap_or_else(|| {
-                    let unit = target
-                        .as_ref()
-                        .map(|t| t.service_name.trim().to_string())
-                        .filter(|u| !u.is_empty())
-                        .unwrap_or_else(|| names.default_unit.to_string());
-                    format!("systemctl restart {unit}")
-                });
-            let mut parts = restart.split_whitespace().map(str::to_string);
-            let command = parts.next().ok_or_else(|| anyhow!("empty restart command"))?;
-            let args: Vec<String> = parts.collect();
+            let legacy = if overview.self_upgrade {
+                logger.line(format!("asking the daemon to install {} {to_version} from its own release provider", names.display));
+                None
+            } else {
+                let restart = target
+                    .as_ref()
+                    .map(|t| t.restart_command.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or_else(|| {
+                        let unit = target
+                            .as_ref()
+                            .map(|t| t.service_name.trim().to_string())
+                            .filter(|u| !u.is_empty())
+                            .unwrap_or_else(|| names.default_unit.to_string());
+                        format!("systemctl restart {unit}")
+                    });
+                let mut parts = restart.split_whitespace().map(str::to_string);
+                let command = parts.next().ok_or_else(|| anyhow!("empty restart command"))?;
+                let args: Vec<String> = parts.collect();
 
-            logger.line(format!("computing the SHA-256 of the {} {to_version} release asset for {} (downloaded once, cached)", names.display, overview.architecture));
-            let sha256 = versions::asset_sha256(state, &run.kind, &to_version, &overview.architecture).await?;
-            let url = versions::download_url(&run.kind, &to_version, &overview.architecture)
-                .ok_or_else(|| anyhow!("no release asset for architecture '{}'", overview.architecture))?;
-            logger.line(format!("asking the daemon to download {url} (sha256 {sha256}) and run `{restart}`"));
-            let applied = instance.upgrade(&url, &sha256, &command, &args).await?;
-            if !applied {
+                logger.line(format!("computing the SHA-256 of the {} {to_version} release asset for {} (downloaded once, cached)", names.display, overview.architecture));
+                let sha256 = versions::asset_sha256(state, &run.kind, &to_version, &overview.architecture).await?;
+                let url = versions::download_url(&run.kind, &to_version, &overview.architecture)
+                    .ok_or_else(|| anyhow!("no release asset for architecture '{}'", overview.architecture))?;
+                // A daemon with its own release provider ignores these keys and installs the
+                // version instead (on panels before 1.2.7 the overview cannot tell the two apart).
+                logger.line(format!("asking the daemon to download {url} (sha256 {sha256}) and run `{restart}`"));
+                Some(inventory::LegacyUpgrade {
+                    url,
+                    sha256,
+                    restart_command: command,
+                    restart_args: args,
+                })
+            };
+            let outcome = instance
+                .upgrade(&inventory::UpgradeRequest {
+                    version: to_version.clone(),
+                    legacy,
+                })
+                .await?;
+            if !outcome.applied {
                 return Err(anyhow!(
                     "the daemon refused: remote upgrades are disabled in its config (ignore_panel_wings_upgrades); use an SSH strategy or enable them"
                 ));
             }
-            logger.line("the daemon accepted the upgrade and is replacing its binary");
+            match outcome.version {
+                Some(version) => logger.line(format!("the daemon accepted the upgrade to {version} and is replacing its binary")),
+                None => logger.line("the daemon accepted the upgrade and is replacing its binary"),
+            }
         }
         db::STRATEGY_SSH_DOCKER | db::STRATEGY_SSH_PACKAGE | db::STRATEGY_SSH_BINARY => {
             let target = target.as_ref().ok_or_else(|| anyhow!("no SSH target configured"))?;

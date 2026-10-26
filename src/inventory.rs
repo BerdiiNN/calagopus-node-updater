@@ -8,13 +8,14 @@
 
 use crate::db::{self, RunRow, TargetRow};
 use crate::versions::{self, LatestInfo};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use shared::State;
 use shared::models::ByUuid;
 use shared::models::database_agent_host::DatabaseAgentHost;
 use shared::models::node::Node;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -24,6 +25,19 @@ use uuid::Uuid;
 pub const STATE_KEY_SNAPSHOT: &str = "inventory.v2";
 const OVERVIEW_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// Both daemon generations download (and the newer ones smoke-test) the release before they
+/// answer the upgrade call, so it gets far longer than the overview poll.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+static UPGRADE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .user_agent("Calagopus Panel")
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(UPGRADE_TIMEOUT)
+        .build()
+        .expect("building the upgrade HTTP client")
+});
+
 /// A Wings node or DB Agent host as the panel knows it, plus the API client to ask it.
 pub struct Instance {
     pub kind: String,
@@ -31,6 +45,8 @@ pub struct Instance {
     pub name: String,
     pub url: String,
     pub location: Option<String>,
+    /// The daemon token in plain text, for the upgrade call.
+    token: String,
     client: Client,
 }
 
@@ -47,6 +63,10 @@ pub struct Overview {
     pub version: Option<semver::Version>,
     pub architecture: String,
     pub container_type: String,
+    /// The daemon names its own release provider (`upgrade` in the overview; Wings 1.2.7 and
+    /// DB Agent 1.2.4 onwards) and installs a version by itself. Only an API client that
+    /// knows the field (panel 1.2.7 onwards) can see it; older panels always read `false`.
+    pub self_upgrade: bool,
 }
 
 fn overview_from_value(value: serde_json::Value) -> Overview {
@@ -68,7 +88,61 @@ fn overview_from_value(value: serde_json::Value) -> Overview {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
+        self_upgrade: value.get("upgrade").is_some_and(|u| u.is_object()),
     }
+}
+
+/// What the daemon's `POST /api/system/upgrade` is asked to install.
+pub struct UpgradeRequest {
+    pub version: semver::Version,
+    /// Where daemons that predate their own release provider (Wings before 1.2.7, DB Agent
+    /// before 1.2.4) download the binary from; they check the SHA-256 and run the restart
+    /// command. `None` when the daemon fetches `version` itself.
+    pub legacy: Option<LegacyUpgrade>,
+}
+
+pub struct LegacyUpgrade {
+    pub url: String,
+    pub sha256: String,
+    pub restart_command: String,
+    pub restart_args: Vec<String>,
+}
+
+pub struct UpgradeOutcome {
+    /// `false` when the daemon has panel-driven upgrades disabled in its config.
+    pub applied: bool,
+    /// The version the daemon resolved, when it reports one.
+    pub version: Option<String>,
+}
+
+/// The upgrade body. With `legacy` it carries the keys of both protocols; each daemon
+/// generation ignores the other's.
+fn upgrade_body(request: &UpgradeRequest) -> serde_json::Value {
+    let mut body = serde_json::json!({ "version": request.version.to_string(), "token": null });
+    if let Some(legacy) = &request.legacy {
+        body["url"] = legacy.url.clone().into();
+        body["headers"] = serde_json::json!({});
+        body["sha256"] = legacy.sha256.clone().into();
+        body["restart_command"] = legacy.restart_command.clone().into();
+        body["restart_command_args"] = legacy.restart_args.clone().into();
+    }
+    body
+}
+
+/// The message of a daemon error response (`{"errors": [..]}`).
+fn daemon_error(body: &serde_json::Value) -> String {
+    body.get("errors")
+        .and_then(|e| e.as_array())
+        .map(|e| e.iter().filter_map(|m| m.as_str()).collect::<Vec<_>>().join("; "))
+        .filter(|m| !m.is_empty())
+        .or_else(|| body.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "no error message".to_string())
+}
+
+/// The token columns are `Vec<u8>` up to panel 1.1.5 and `EncryptedString` since; both are
+/// `AsRef<[u8]>`, which every generation's `Database::decrypt` accepts.
+async fn plain_token(state: &State, token: &impl AsRef<[u8]>) -> Result<String> {
+    Ok(state.database.decrypt(token.as_ref().to_vec()).await?.to_string())
 }
 
 impl Instance {
@@ -90,31 +164,56 @@ impl Instance {
         Ok(overview_from_value(value))
     }
 
-    /// Ask the daemon to download `url`, verify `sha256`, swap its binary and run the
-    /// restart command. `Ok(false)` means the daemon has upgrades disabled in its config.
-    pub async fn upgrade(&self, url: &str, sha256: &str, restart_command: &str, restart_args: &[String]) -> Result<bool> {
-        let body = serde_json::json!({
-            "url": url,
-            "headers": {},
-            "sha256": sha256,
-            "restart_command": restart_command,
-            "restart_command_args": restart_args,
-        });
-        let applied = match &self.client {
-            Client::Wings(client) => {
-                let body: wings_api::system_upgrade::post::RequestBody =
-                    serde_json::from_value(body).context("building the upgrade request")?;
-                let response = client.post_system_upgrade(&body).await?;
-                serde_json::to_value(response)?
-            }
-            Client::DbAgent(client) => {
-                let body: db_agent_api::system_upgrade::post::RequestBody =
-                    serde_json::from_value(body).context("building the upgrade request")?;
-                let response = client.post_system_upgrade(&body).await?;
-                serde_json::to_value(response)?
-            }
-        };
-        Ok(applied.get("applied").and_then(|v| v.as_bool()).unwrap_or(false))
+    /// Ask the daemon to replace its binary with `request.version` and restart.
+    ///
+    /// Sent directly rather than through the API client: panel 1.2.7 changed the client's
+    /// request body to the new protocol (`{version, token}` instead of `{url, sha256,
+    /// restart_command, ..}`), and every panel generation has to upgrade every daemon
+    /// generation.
+    pub async fn upgrade(&self, request: &UpgradeRequest) -> Result<UpgradeOutcome> {
+        let response = UPGRADE_CLIENT
+            .post(format!("{}/api/system/upgrade", self.url.trim_end_matches('/')))
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&upgrade_body(request))
+            .send()
+            .await
+            .map_err(|err| anyhow!("calling the upgrade API: {}", err.without_url()))?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+        if !status.is_success() {
+            return Err(anyhow!("the daemon answered {status}: {}", daemon_error(&body)));
+        }
+        Ok(UpgradeOutcome {
+            applied: body.get("applied").and_then(|v| v.as_bool()).unwrap_or(false),
+            version: body.get("version").and_then(|v| v.as_str()).map(str::to_string),
+        })
+    }
+
+    async fn wings(state: &State, node: &Node) -> Result<Self> {
+        let token = plain_token(state, &node.token).await.context("decrypting the node token")?;
+        Ok(Self {
+            kind: db::KIND_WINGS.to_string(),
+            uuid: node.uuid,
+            name: node.name.to_string(),
+            url: node.url.to_string(),
+            location: Some(node.location.name.to_string()),
+            client: Client::Wings(wings_api::client::WingsClient::new(node.url.to_string(), token.clone())),
+            token,
+        })
+    }
+
+    async fn db_agent(state: &State, host: &DatabaseAgentHost) -> Result<Self> {
+        let token = plain_token(state, &host.token).await.context("decrypting the DB Agent token")?;
+        Ok(Self {
+            kind: db::KIND_DB_AGENT.to_string(),
+            uuid: host.uuid,
+            name: host.name.to_string(),
+            url: host.url.to_string(),
+            location: None,
+            client: Client::DbAgent(db_agent_api::client::DbAgentClient::new(host.url.to_string(), token.clone())),
+            token,
+        })
     }
 
     /// Host name of the daemon URL, the natural default for the SSH host.
@@ -141,15 +240,7 @@ async fn wings_instances(state: &State) -> Result<Vec<Instance>> {
         .context("listing nodes")?;
     let mut out = Vec::with_capacity(nodes.data.len());
     for node in nodes.data {
-        let client = node.api_client(&state.database).await.context("building the Wings client")?;
-        out.push(Instance {
-            kind: db::KIND_WINGS.to_string(),
-            uuid: node.uuid,
-            name: node.name.to_string(),
-            url: node.url.to_string(),
-            location: Some(node.location.name.to_string()),
-            client: Client::Wings(client),
-        });
+        out.push(Instance::wings(state, &node).await?);
     }
     Ok(out)
 }
@@ -160,15 +251,7 @@ async fn db_agent_instances(state: &State) -> Result<Vec<Instance>> {
         .context("listing DB Agent hosts")?;
     let mut out = Vec::with_capacity(hosts.data.len());
     for host in hosts.data {
-        let client = host.api_client(&state.database).await.context("building the DB Agent client")?;
-        out.push(Instance {
-            kind: db::KIND_DB_AGENT.to_string(),
-            uuid: host.uuid,
-            name: host.name.to_string(),
-            url: host.url.to_string(),
-            location: None,
-            client: Client::DbAgent(client),
-        });
+        out.push(Instance::db_agent(state, &host).await?);
     }
     Ok(out)
 }
@@ -191,15 +274,7 @@ pub async fn instance(state: &State, kind: &str, uuid: Uuid) -> Result<Option<In
             let Some(node) = Node::by_uuid_optional(&state.database, uuid).await.context("loading node")? else {
                 return Ok(None);
             };
-            let client = node.api_client(&state.database).await?;
-            Ok(Some(Instance {
-                kind: kind.to_string(),
-                uuid: node.uuid,
-                name: node.name.to_string(),
-                url: node.url.to_string(),
-                location: Some(node.location.name.to_string()),
-                client: Client::Wings(client),
-            }))
+            Ok(Some(Instance::wings(state, &node).await?))
         }
         db::KIND_DB_AGENT => {
             let Some(host) = DatabaseAgentHost::by_uuid_optional(&state.database, uuid)
@@ -208,15 +283,7 @@ pub async fn instance(state: &State, kind: &str, uuid: Uuid) -> Result<Option<In
             else {
                 return Ok(None);
             };
-            let client = host.api_client(&state.database).await?;
-            Ok(Some(Instance {
-                kind: kind.to_string(),
-                uuid: host.uuid,
-                name: host.name.to_string(),
-                url: host.url.to_string(),
-                location: None,
-                client: Client::DbAgent(client),
-            }))
+            Ok(Some(Instance::db_agent(state, &host).await?))
         }
         _ => Ok(None),
     }
@@ -237,6 +304,9 @@ pub struct DaemonEntry {
     pub installed_raw: String,
     pub architecture: String,
     pub container_type: String,
+    /// Absent in snapshots stored before 1.0.1.
+    #[serde(default)]
+    pub self_upgrade: bool,
     pub error: Option<String>,
 }
 
@@ -250,6 +320,7 @@ impl DaemonEntry {
             version: self.installed.clone(),
             architecture: self.architecture.clone(),
             container_type: self.container_type.clone(),
+            self_upgrade: self.self_upgrade,
         })
     }
 }
@@ -284,6 +355,7 @@ pub async fn poll(state: &State) -> Result<Snapshot> {
                 installed_raw: overview.as_ref().map(|o| o.version_raw.clone()).unwrap_or_default(),
                 architecture: overview.as_ref().map(|o| o.architecture.clone()).unwrap_or_default(),
                 container_type: overview.as_ref().map(|o| o.container_type.clone()).unwrap_or_default(),
+                self_upgrade: overview.as_ref().is_some_and(|o| o.self_upgrade),
                 error,
             }
         })
@@ -392,7 +464,7 @@ pub fn plan(
         // No row: the daemon's own upgrade API is still usable for a bare-metal install.
         return match overview {
             Some(o) if o.container_type.is_empty() || o.container_type == "none" => {
-                if versions::normalise_arch(&o.architecture).is_none() {
+                if !o.self_upgrade && versions::normalise_arch(&o.architecture).is_none() {
                     (
                         String::new(),
                         false,
@@ -464,7 +536,7 @@ pub fn plan(
             Some("the daemon runs in a container; its upgrade API refuses, use an SSH strategy".to_string()),
             needs_force,
         ),
-        Some(o) if versions::normalise_arch(&o.architecture).is_none() => (
+        Some(o) if !o.self_upgrade && versions::normalise_arch(&o.architecture).is_none() => (
             strategy,
             false,
             Some(format!("no release asset exists for architecture '{}'", o.architecture)),
@@ -568,7 +640,71 @@ pub async fn cached(state: &State, latest: &LatestInfo, allow_ahead_of_panel: bo
 
 #[cfg(test)]
 mod tests {
-    use super::url_host;
+    use super::{DaemonEntry, LegacyUpgrade, UpgradeRequest, daemon_error, overview_from_value, upgrade_body, url_host};
+    use serde_json::json;
+
+    #[test]
+    fn upgrade_body_for_self_upgrading_daemons_is_the_new_protocol() {
+        let request = UpgradeRequest {
+            version: semver::Version::new(1, 2, 7),
+            legacy: None,
+        };
+        assert_eq!(upgrade_body(&request), json!({ "version": "1.2.7", "token": null }));
+    }
+
+    #[test]
+    fn legacy_upgrade_body_carries_both_protocols() {
+        let request = UpgradeRequest {
+            version: semver::Version::new(1, 2, 7),
+            legacy: Some(LegacyUpgrade {
+                url: "https://example.com/wings".into(),
+                sha256: "ab".into(),
+                restart_command: "systemctl".into(),
+                restart_args: vec!["restart".into(), "wings".into()],
+            }),
+        };
+        assert_eq!(
+            upgrade_body(&request),
+            json!({
+                "version": "1.2.7",
+                "token": null,
+                "url": "https://example.com/wings",
+                "headers": {},
+                "sha256": "ab",
+                "restart_command": "systemctl",
+                "restart_command_args": ["restart", "wings"],
+            })
+        );
+    }
+
+    #[test]
+    fn reads_the_release_provider_from_the_overview() {
+        let base = json!({ "version": "1.2.7", "architecture": "x86_64", "container_type": "none" });
+        assert!(!overview_from_value(base.clone()).self_upgrade);
+        let mut none = base.clone();
+        none["upgrade"] = serde_json::Value::Null;
+        assert!(!overview_from_value(none).self_upgrade);
+        let mut provider = base;
+        provider["upgrade"] = json!({ "provider": "github", "repository": "calagopus/wings", "api_url": "https://api.github.com" });
+        assert!(overview_from_value(provider).self_upgrade);
+    }
+
+    #[test]
+    fn daemon_errors_are_joined() {
+        assert_eq!(daemon_error(&json!({ "errors": ["a", "b"] })), "a; b");
+        assert_eq!(daemon_error(&json!({ "error": "c" })), "c");
+        assert_eq!(daemon_error(&serde_json::Value::Null), "no error message");
+    }
+
+    #[test]
+    fn snapshots_from_1_0_0_still_load() {
+        let entry: DaemonEntry = serde_json::from_value(json!({
+            "kind": "wings", "ref_uuid": "123e4567-e89b-12d3-a456-426614174000", "name": "n", "url": "https://n",
+            "location": null, "host": null, "installed": null, "installed_raw": "", "architecture": "", "container_type": "", "error": null,
+        }))
+        .unwrap();
+        assert!(!entry.self_upgrade);
+    }
 
     #[test]
     fn extracts_hosts() {

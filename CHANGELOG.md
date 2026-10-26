@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 (2026-10-26)
+
+- Builds on panel 1.2.7, whose API client no longer serializes the daemon upgrade response.
+- The `api` strategy speaks both daemon upgrade protocols on every panel version: Wings 1.2.7 and DB Agent 1.2.4 onwards are asked for a version and fetch it from their own release provider; older daemons still get the download URL, SHA-256 and restart command. Panel 1.2.7 can therefore update nodes that still run Wings 1.2.6 or older, and older panels can update nodes that already run the new Wings.
+- The upgrade call waits up to 15 minutes, because both daemon generations download the release before they answer.
+- No architecture check for daemons that pick their own release asset.
+
 ## 1.0.0 (2026-09-21)
 
 First public release.
